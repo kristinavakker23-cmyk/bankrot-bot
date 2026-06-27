@@ -1,5 +1,7 @@
 .env
 __pycache__/
 *.pyc
-*.pyc
 bot.log
+test_*.py
+scan.py
+src/
