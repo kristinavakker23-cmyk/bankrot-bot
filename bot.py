@@ -121,65 +121,55 @@ def fetch_rad_lots(max_pages=5):
 
 
 def _parse_catalog_page(soup, cat_id, cat_name, cat_margin):
-    """Парсим страницу каталога — ищем карточки лотов."""
+    """Парсим страницу каталога lot-online.ru."""
     lots = []
-    # lot-online.ru использует div.product-preview или类似的 структуры
-    # Ищем ссылки на лоты
-    product_links = soup.find_all("a", href=True)
-    seen_ids = set()
+    # Основные карточки лотов
+    cards = soup.select(".ty-grid-list__item")
+    if not cards:
+        cards = soup.select(".ty-compact-list__item")
 
-    for a in product_links:
-        href = a.get("href", "")
-        if "products.view" not in href:
-            continue
-        # Извлекаем product_id
-        m = re.search(r"product_id=(\d+)", href)
-        if not m:
-            continue
-        pid = m.group(1)
-        if pid in seen_ids:
-            continue
-        seen_ids.add(pid)
-
-        # Ищем название лота
-        title = a.get_text(strip=True)
-        if not title or len(title) < 5:
-            # Пробуем родительский элемент
-            parent = a.find_parent(["div", "li", "article"])
-            if parent:
-                title_el = parent.find(["h2", "h3", "h4", ".product-title", ".lot-title"])
-                if title_el:
-                    title = title_el.get_text(strip=True)
+    for card in cards:
+        # Название — ссылка с product_id и текстом
+        title = ""
+        url = ""
+        for a in card.find_all("a", href=True):
+            href = a.get("href", "")
+            if "products.view" in href and "product_id" in href:
+                text = a.get_text(strip=True)
+                if text and len(text) > len(title):
+                    title = text
+                    pid_m = re.search(r"product_id=(\d+)", href)
+                    if pid_m:
+                        url = f"https://catalog.lot-online.ru/index.php?dispatch=products.view&product_id={pid_m.group(1)}"
 
         if not title or len(title) < 5:
             continue
 
-        # Ищем цену — рядом с ссылкой
+        # Цена — .ty-price или ищем число с ₽
         price = 0
-        parent = a.find_parent(["div", "li", "article"])
-        if parent:
-            price_text = parent.get_text()
-            # Ищем паттерн "XXX XXX ₽" или "Цена XXX"
-            price_match = re.search(r"([\d\s]{3,15})\s*₽", price_text)
-            if price_match:
-                price = float(price_match.group(1).replace(" ", ""))
-            else:
-                price_match = re.search(r"Цена[:\s]*([\d\s]+)", price_text)
-                if price_match:
-                    price = float(price_match.group(1).replace(" ", ""))
+        price_el = card.select_one(".ty-price")
+        if price_el:
+            price_text = price_el.get_text(strip=True)
+            price_num = re.sub(r"[^\d]", "", price_text)
+            if price_num:
+                price = float(price_num)
+        if price <= 0:
+            # Фоллбэк: ищем любое число > 999
+            for txt in card.find_all(string=re.compile(r"\d{4,}")):
+                clean = re.sub(r"[^\d]", "", txt)
+                if clean and int(clean) > 999:
+                    price = float(clean)
+                    break
 
         if price <= 0:
-            price = cat_margin * 10  # если цена не нашлась, ставим заглушку
+            continue
 
         # Дата окончания
         date_end = ""
-        if parent:
-            date_match = re.search(r"Торги через (\d+) дн", parent.get_text())
-            if date_match:
-                days = int(date_match.group(1))
-                date_end = f"через {days} дн."
-
-        url = f"https://catalog.lot-online.ru/index.php?dispatch=products.view&product_id={pid}"
+        card_text = card.get_text()
+        days_match = re.search(r"Торги через (\d+) дн", card_text)
+        if days_match:
+            date_end = f"через {days_match.group(1)} дн."
 
         lots.append({
             "title": title[:120],
