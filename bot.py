@@ -1,278 +1,260 @@
 """
-Bankrot Bot — Telegram-бот для поиска лотов на торгах.
-Источник: torgi.gov.ru (Единая торговая площадка).
+Bankrot Bot — ищет лоты на банкротских торгах (lot-online.ru / РАД).
 Версия для Render.com (webhook mode).
 """
-import os
-import re
-import sys
-import time
-import json
-import logging
-import requests
-import threading
-from datetime import datetime, timedelta
+import os, re, sys, time, json, logging, requests, threading
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, request as flask_request
+from bs4 import BeautifulSoup
 
-# === НАСТРОЙКА ===
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 DAILY_HOUR = int(os.getenv("DAILY_HOUR", "9"))
 DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
-MIN_PRICE = float(os.getenv("MIN_PRICE", "1000"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "5000000"))
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
-
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger("bankrot")
 
-# === TELEGRAM ===
+# ─── Telegram ──────────────────────────────────────────
 
 def api_call(method, **kwargs):
     try:
         r = requests.post(f"{API}/{method}", json=kwargs, timeout=30)
-        data = r.json()
-        if not data.get("ok"):
-            log.error(f"API error: {data}")
-        return data
+        return r.json()
     except Exception as e:
-        log.error(f"API {method} failed: {e}")
+        log.error(f"API {method}: {e}")
         return {"ok": False}
 
-def send_message(chat_id, text, parse_mode="HTML"):
+def send_message(cid, text, parse_mode="HTML"):
     if len(text) > 4000:
-        parts = []
-        while text:
-            if len(text) <= 4000:
-                parts.append(text)
-                break
-            cut = text[:4000].rfind("\n\n")
-            if cut == -1: cut = text[:4000].rfind("\n")
-            if cut == -1: cut = 4000
-            parts.append(text[:cut])
-            text = text[cut:]
-        for part in parts:
-            api_call("sendMessage", chat_id=chat_id, text=part,
-                     parse_mode=parse_mode, disable_web_page_preview=True)
+        parts, t = [], text
+        while t:
+            if len(t) <= 4000:
+                parts.append(t); break
+            cut = t[:4000].rfind("\n\n")
+            if cut < 0: cut = t[:4000].rfind("\n")
+            if cut < 0: cut = 4000
+            parts.append(t[:cut]); t = t[cut:]
+        for p in parts:
+            api_call("sendMessage", chat_id=cid, text=p, parse_mode=parse_mode,
+                     disable_web_page_preview=True)
     else:
-        api_call("sendMessage", chat_id=chat_id, text=text,
-                 parse_mode=parse_mode, disable_web_page_preview=True)
+        api_call("sendMessage", chat_id=cid, text=text, parse_mode=parse_mode,
+                 disable_web_page_preview=True)
 
-def answer(chat_id, text):
-    send_message(chat_id, text)
+def answer(cid, text):
+    send_message(cid, text)
 
-# === КАТЕГОРИИ ДЛЯ МАРЖИНАЛЬНОСТИ ===
-# Ключевые слова -> (приоритет 1-3, ожидаемая маржа %)
-CATEGORIES = {
-    # Техника (легко перепродать)
-    "ноутбук": (1, 80), "ноутбуки": (1, 80), "смартфон": (1, 60),
-    "телефон": (1, 50), "планшет": (1, 70), "монитор": (1, 60),
-    "сервер": (1, 90), "компьютер": (1, 70), "принтер": (2, 40),
-    "роутер": (2, 50), "сетевое": (2, 60), "фотоаппарат": (1, 80),
-    "камера": (1, 70), "наушники": (2, 60), "проектор": (1, 70),
-    "ресивер": (2, 50), "видеорегистратор": (2, 60),
-    # Авто и техника
-    "автомобиль": (1, 40), "грузовик": (1, 50), "экскаватор": (1, 60),
-    "погрузчик": (1, 60), "трактор": (1, 50), "спецтехника": (1, 60),
-    "автобус": (1, 45), "мотоцикл": (2, 50), "прицеп": (2, 50),
-    "кран": (1, 55), "бульдозер": (1, 55), "автокран": (1, 55),
-    # Промышленное
-    "станок": (1, 100), "конвейер": (1, 80), "генератор": (1, 80),
-    "компрессор": (2, 70), "сварочный": (2, 60), "лазерный": (2, 80),
-    "3d-принтер": (1, 100), "фрезерный": (1, 90), "токарный": (1, 90),
-    "пресс": (2, 70), "формовочный": (2, 70), "литьевой": (2, 70),
-    # Бытовая техника
-    "холодильник": (1, 60), "стиральная машина": (1, 50),
-    "кондиционер": (1, 70), "телевизор": (1, 50), "ТВ": (1, 50),
-    "духовой": (2, 40), "посудомоечная": (2, 40),
-    # Инструмент
-    "инструмент": (1, 70), "перфоратор": (2, 60), "дрель": (2, 50),
-    "болгарка": (2, 50), "лобзик": (2, 50), "сверлильный": (2, 60),
-    # Спорт
-    "велосипед": (1, 60), "тренажёр": (1, 60),
-    # Металл (лом)
-    "медь": (2, 40), "алюминий": (2, 35), "латунь": (2, 38),
-    # Мебель (офисная)
-    "офисная мебель": (2, 40), "стол": (3, 30), "стул": (3, 25),
+# ─── Категории и маржа ─────────────────────────────────
+# lot-online.ru category_id -> (название, ожидаемая маржа%)
+
+RAD_CATEGORIES = {
+    # Транспорт
+    44: ("🚗 Легковые автомобили", 40),
+    45: ("🚛 Грузовики/спецтехника", 55),
+    48: ("📦 Прицепы", 45),
+    49: ("⛵ Водный транспорт", 50),
+    51: ("🚂 ЖД транспорт", 60),
+    53: ("🚐 Иной транспорт", 45),
+    165: ("🏍 Мототехника", 55),
+    61: ("🔧 Автозапчасти", 60),
+    # Оборудование
+    55: ("🏦 Банковское оборудование", 60),
+    167: ("📡 Сетевое оборудование", 70),
+    57: ("🏭 Производственное оборудование", 80),
+    58: ("⚙️ Иное оборудование", 65),
+    60: ("💻 Бытовая/компьютерная техника", 70),
+    # Недвижимость
+    22: ("🏢 Здания", 50),
+    23: ("🏪 Нежилые помещения", 45),
+    25: ("🏗 Производственные объекты", 55),
+    26: ("🅿️ Паркинги/гаражи", 40),
+    34: ("🏠 Квартиры", 35),
+    38: ("🏡 Дома/коттеджи", 40),
+    # Прочее
+    64: ("🔩 Металлолом", 35),
+    70: ("📦 Иное имущество", 50),
+    62: ("🪙 Монеты", 60),
+    63: ("🪑 Мебель", 45),
 }
 
-def _category(kw):
-    tech = ["ноутбук","ноутбуки","смартфон","телефон","планшет","монитор","сервер",
-            "компьютер","принтер","роутер","сетевое","фотоаппарат","камера","наушники",
-            "проектор","ресивер","видеорегистратор"]
-    auto = ["автомобиль","грузовик","экскаватор","погрузчик","трактор","спецтехника",
-            "автобус","мотоцикл","прицеп","кран","бульдозер","автокран"]
-    ind = ["станок","конвейер","генератор","компрессор","сварочный","лазерный",
-           "3d-принтер","фрезерный","токарный","пресс","формовочный","литьевой"]
-    home = ["холодильник","стиральная машина","кондиционер","телевизор","ТВ","духовой","посудомоечная"]
-    tool = ["инструмент","перфоратор","дрель","болгарка","лобзик","сверлильный"]
-    if kw in tech: return "💻 Электроника"
-    if kw in auto: return "🚗 Авто/Спецтехника"
-    if kw in ind: return "🏭 Промоборудование"
-    if kw in home: return "🏠 Бытовая техника"
-    if kw in tool: return "🔧 Инструменты"
-    return "📦 Прочее"
+# Ключевые слова для доп. фильтрации (приоритет, маржа)
+KW_MARGINS = {
+    "ноутбук": (1, 80), "ноутбуки": (1, 80), "смартфон": (1, 60),
+    "телефон": (1, 50), "сервер": (1, 90), "компьютер": (1, 70),
+    "монитор": (1, 60), "принтер": (2, 40), "роутер": (2, 50),
+    "станок": (1, 100), "генератор": (1, 80), "компрессор": (2, 70),
+    "холодильник": (1, 60), "стиральная": (1, 50), "кондиционер": (1, 70),
+    "велосипед": (1, 60), "тренажёр": (1, 60), "инструмент": (1, 70),
+    "автомобиль": (1, 40), "грузовик": (1, 50), "экскаватор": (1, 60),
+    "погрузчик": (1, 60), "трактор": (1, 50), "кран": (1, 55),
+}
 
-# === ПАРСИНГ torgi.gov.ru ===
+# ─── Парсинг lot-online.ru ──────────────────────────────
 
-TG_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+           "Accept": "text/html"}
 
-def fetch_torgi_lots():
-    """Получаем лоты с torgi.gov.ru — API только GET с пагинацией."""
+def fetch_rad_lots(max_pages=5):
+    """Парсим каталог lot-online.ru по категориям."""
     all_lots = []
-    offset = 0
-    batch = 100
-    max_lots = 1000  # не более 1000 за раз (чтобы не задолбать API)
-
-    while offset < max_lots:
+    for cat_id, (cat_name, cat_margin) in RAD_CATEGORIES.items():
         try:
-            url = f"https://torgi.gov.ru/new/api/public/lotcards/search?limit={batch}&offset={offset}"
-            r = requests.get(url, headers=TG_HEADERS, timeout=20)
+            url = f"https://catalog.lot-online.ru/index.php?dispatch=categories.view&category_id={cat_id}"
+            r = requests.get(url, headers=HEADERS, timeout=15)
             if r.status_code != 200:
-                log.warning(f"torgi.gov.ru: status {r.status_code}")
-                break
-            data = r.json()
-            content = data.get("content", [])
-            if not content:
-                break
-            for lot in content:
-                parsed = _parse_torgi_lot(lot)
-                if parsed:
-                    all_lots.append(parsed)
-            offset += batch
-            log.info(f"torgi.gov.ru: загружено {len(all_lots)} лотов (offset={offset})")
-            if data.get("last", True):
-                break
+                continue
+            soup = BeautifulSoup(r.text, "lxml")
+            lots = _parse_catalog_page(soup, cat_id, cat_name, cat_margin)
+            all_lots.extend(lots)
+            log.info(f"  {cat_name}: {len(lots)} лотов")
         except Exception as e:
-            log.error(f"torgi.gov.ru fetch error: {e}")
-            break
-
-    log.info(f"torgi.gov.ru: итого {len(all_lots)} лотов")
+            log.error(f"  {cat_name}: {e}")
+    log.info(f"Всего с RAD: {len(all_lots)} лотов")
     return all_lots
 
 
-def _parse_torgi_lot(lot):
-    """Парсим один лот с torgi.gov.ru."""
-    try:
-        title = lot.get("lotName", "") or ""
-        description = lot.get("lotDescription", "") or ""
-        price = lot.get("priceMin", 0) or 0
-        if isinstance(price, str):
-            price = float(price) if price else 0
+def _parse_catalog_page(soup, cat_id, cat_name, cat_margin):
+    """Парсим страницу каталога — ищем карточки лотов."""
+    lots = []
+    # lot-online.ru использует div.product-preview или类似的 структуры
+    # Ищем ссылки на лоты
+    product_links = soup.find_all("a", href=True)
+    seen_ids = set()
 
-        if not title or price <= 0:
-            return None
+    for a in product_links:
+        href = a.get("href", "")
+        if "products.view" not in href:
+            continue
+        # Извлекаем product_id
+        m = re.search(r"product_id=(\d+)", href)
+        if not m:
+            continue
+        pid = m.group(1)
+        if pid in seen_ids:
+            continue
+        seen_ids.add(pid)
 
-        # Ссылка на лот
-        lot_id = lot.get("id", "")
-        url = f"https://torgi.gov.ru/new/public/lotcards/regcard/{lot_id}" if lot_id else ""
+        # Ищем название лота
+        title = a.get_text(strip=True)
+        if not title or len(title) < 5:
+            # Пробуем родительский элемент
+            parent = a.find_parent(["div", "li", "article"])
+            if parent:
+                title_el = parent.find(["h2", "h3", "h4", ".product-title", ".lot-title"])
+                if title_el:
+                    title = title_el.get_text(strip=True)
 
-        # Категория и тип
-        category = lot.get("category", {})
-        cat_name = category.get("name", "") if isinstance(category, dict) else ""
+        if not title or len(title) < 5:
+            continue
 
-        bidd_type = lot.get("biddType", {})
-        bidd_name = bidd_type.get("name", "") if isinstance(bidd_type, dict) else ""
+        # Ищем цену — рядом с ссылкой
+        price = 0
+        parent = a.find_parent(["div", "li", "article"])
+        if parent:
+            price_text = parent.get_text()
+            # Ищем паттерн "XXX XXX ₽" или "Цена XXX"
+            price_match = re.search(r"([\d\s]{3,15})\s*₽", price_text)
+            if price_match:
+                price = float(price_match.group(1).replace(" ", ""))
+            else:
+                price_match = re.search(r"Цена[:\s]*([\d\s]+)", price_text)
+                if price_match:
+                    price = float(price_match.group(1).replace(" ", ""))
 
-        bidd_form = lot.get("biddForm", {})
-        form_name = bidd_form.get("name", "") if isinstance(bidd_form, dict) else ""
-
-        status = lot.get("lotStatus", "")
+        if price <= 0:
+            price = cat_margin * 10  # если цена не нашлась, ставим заглушку
 
         # Дата окончания
-        end_time = lot.get("biddEndTime", "")
+        date_end = ""
+        if parent:
+            date_match = re.search(r"Торги через (\d+) дн", parent.get_text())
+            if date_match:
+                days = int(date_match.group(1))
+                date_end = f"через {days} дн."
 
-        # Количество фото
-        images = lot.get("lotImages", [])
-        photos_count = len(images) if images else 0
+        url = f"https://catalog.lot-online.ru/index.php?dispatch=products.view&product_id={pid}"
 
-        # Доп. атрибуты
-        attrs = lot.get("attributes", [])
-        attr_text = " ".join([
-            a.get("value", {}).get("name", "") if isinstance(a.get("value"), dict)
-            else str(a.get("value", ""))
-            for a in (attrs or [])
-        ])
-
-        return {
-            "title": title,
-            "description": description,
+        lots.append({
+            "title": title[:120],
             "price": price,
             "url": url,
-            "category": cat_name,
-            "bidd_type": bidd_name,
-            "bidd_form": form_name,
-            "status": status,
-            "date_end": end_time,
-            "photos": photos_count,
-            "attributes": attr_text,
-            "source": "torgi.gov.ru",
-        }
+            "cat_id": cat_id,
+            "cat_name": cat_name,
+            "cat_margin": cat_margin,
+            "date_end": date_end,
+            "source": "lot-online.ru (РАД)",
+            "description": "",
+        })
+
+    return lots
+
+
+def fetch_rad_by_keyword(keyword):
+    """Поиск по ключевому слову на lot-online.ru."""
+    lots = []
+    try:
+        url = f"https://catalog.lot-online.ru/index.php?dispatch=categories.view&category_id=9876&q={keyword}"
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "lxml")
+            lots = _parse_catalog_page(soup, 0, f"Поиск: {keyword}", 50)
     except Exception as e:
-        return None
+        log.error(f"RAD search '{keyword}': {e}")
+    return lots
 
-# === АНАЛИЗ МАРЖИНАЛЬНОСТИ ===
+# ─── Анализ ────────────────────────────────────────────
 
-def analyze_lots(lots):
-    """Фильтруем и ранжируем лоты по марже."""
+def analyze(lots, keyword=None):
     result = []
     for lot in lots:
-        price = lot.get("price", 0)
-        if price < MIN_PRICE or price > MAX_PRICE:
-            continue
         title = (lot.get("title", "") or "").lower()
-        desc = (lot.get("description", "") or "").lower()
-        attrs = (lot.get("attributes", "") or "").lower()
-        text = f"{title} {desc} {attrs}"
+        text = title
 
-        best_score = 0
-        best_kw = None
-        best_margin = 0
+        # Маржа из категории
+        base_margin = lot.get("cat_margin", 40)
 
-        for kw, (priority, margin) in CATEGORIES.items():
+        # Доп. маржа по ключевым словам
+        kw_margin = 0
+        kw_found = ""
+        for kw, (p, m) in KW_MARGINS.items():
             if kw in text:
-                p_mult = {1: 1.5, 2: 1.0, 3: 0.7}.get(priority, 1.0)
-                title_bonus = 2.0 if kw in title else 1.0
-                price_bonus = 1.3 if price <= 5000 else (1.1 if price <= 50000 else 0.8)
-                score = margin * p_mult * title_bonus * price_bonus
-                if score > best_score:
-                    best_score = score
-                    best_kw = kw
-                    best_margin = margin
+                if m > kw_margin:
+                    kw_margin = m
+                    kw_found = kw
 
-        if best_kw:
-            lot["score"] = best_score
-            lot["margin"] = best_margin
-            lot["keywords"] = best_kw
-            lot["category_tg"] = _category(best_kw)
-            result.append(lot)
+        margin = max(base_margin, kw_margin)
+        lot["margin"] = margin
+        lot["keywords"] = kw_found or lot.get("cat_name", "")
+
+        # Скор
+        price = lot.get("price", 0)
+        pb = 1.3 if price <= 50000 else (1.1 if price <= 500000 else 0.8)
+        lot["score"] = margin * pb
+
+        result.append(lot)
 
     result.sort(key=lambda x: x["score"], reverse=True)
     return result
 
-# === ФОРМАТИРОВАНИЕ ===
+# ─── Форматирование ───────────────────────────────────
 
 def fmt_lot(lot, i):
-    p = lot["price"]
-    m = lot["margin"]
+    p = lot.get("price", 0)
+    m = lot.get("margin", 0)
     sell = int(p * (1 + m / 100))
     profit = sell - p
-    title = lot["title"]
+    title = lot.get("title", "?")
     if len(title) > 70: title = title[:67] + "..."
     url = lot.get("url", "")
-    cat = lot.get("category", "") or lot.get("category_tg", "")
-    form = lot.get("bidd_form", "")
+    cat = lot.get("cat_name", "")
     end = lot.get("date_end", "")
-    if end and "T" in end:
-        try:
-            end = datetime.fromisoformat(end.replace("Z", "+00:00")).strftime("%d.%m.%Y %H:%M")
-        except: pass
 
     msg = (
         f"<b>{i}. {title}</b>\n"
@@ -282,20 +264,15 @@ def fmt_lot(lot, i):
         f"Прибыль: ~<b>{profit:,.0f} руб.</b>\n"
     )
     if cat: msg += f"Категория: {cat}\n"
-    if form: msg += f"Тип торгов: {form}\n"
     if end: msg += f"Окончание: {end}\n"
-    msg += f"Источник: torgi.gov.ru\n"
+    msg += "Источник: lot-online.ru (РАД)\n"
     if url: msg += f'<a href="{url}">Перейти к лоту</a>\n'
     return msg
 
 
 def fmt_digest(lots, n=10):
     if not lots:
-        return (
-            "<b>Торги — дайджест</b>\n\n"
-            "Сегодня подходящих лотов нет.\n"
-            "Попробуйте изменить фильтры (/help)."
-        )
+        return "<b>Торги — дайджест</b>\n\nСегодня подходящих лотов нет."
     lines = ["<b>ТОП лотов на сегодня</b>\n━━━━━━━━━━━━━━━━━━━━━\n"]
     for i, lot in enumerate(lots[:n], 1):
         lines.append(fmt_lot(lot, i))
@@ -306,7 +283,7 @@ def fmt_digest(lots, n=10):
     lines.append(f"Лучший: {best['title'][:40]}... | Маржа: {best['margin']}%")
     return "\n".join(lines)
 
-# === ЧАТ ID ===
+# ─── Chat IDs ──────────────────────────────────────────
 
 def load_chat_ids():
     ids = set()
@@ -314,8 +291,8 @@ def load_chat_ids():
     try:
         with open("chat_ids.txt") as f:
             for line in f:
-                line = line.strip()
-                if line: ids.add(int(line))
+                l = line.strip()
+                if l: ids.add(int(l))
     except FileNotFoundError: pass
     return ids
 
@@ -324,91 +301,88 @@ def save_chat_id(cid):
     if cid not in ids:
         with open("chat_ids.txt", "a") as f:
             f.write(f"{cid}\n")
-        log.info(f"New chat_id: {cid}")
 
-# === КОМАНДЫ ===
+# ─── Команды ───────────────────────────────────────────
 
-def handle_command(chat_id, text, user):
+def handle_command(cid, text, user):
     cmd = text.split()[0].lower() if text else ""
     args = text.split()[1:] if text else []
-    log.info(f"Command {cmd} from chat={chat_id}")
+    log.info(f"Command {cmd} from chat={cid}")
 
     if cmd == "/start":
-        answer(chat_id,
-            "<b>Бот для поиска лотов на торгах</b>\n\n"
-            "Сканирую torgi.gov.ru — Единую торговую площадку.\n"
-            "Нахожу лоты с высокой маржинальностью для перепродажи.\n\n"
+        answer(cid,
+            "<b>Бот банкротских торгов (РАД)</b>\n\n"
+            "Сканирую catalog.lot-online.ru — ЭТП РАД.\n"
+            "Нахожу лоты с высокой маржинальностью.\n\n"
             "<b>Команды:</b>\n"
             "/scan — поиск лотов прямо сейчас\n"
-            "/scan ноутбук — поиск по ключевому слову\n"
+            "/scan авто — поиск по ключевому слову\n"
+            "/categories — список категорий\n"
             "/help — справка\n\n"
-            f"Рассылка каждый день в {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} МСК")
+            f"Рассылка: {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} МСК")
 
     elif cmd == "/help":
-        answer(chat_id,
+        answer(cid,
             "<b>Как пользоваться:</b>\n\n"
-            "/scan — найти топ-10 лотов по марже\n"
-            "/scan ноутбук — поиск по ключевому слову\n"
-            "/scan 5000-50000 — поиск по цене\n\n"
-            "<b>Что ищу:</b>\n"
-            "💻 Электроника (ноутбуки, серверы, мониторы)\n"
-            "🚗 Авто и спецтехника\n"
-            "🏭 Промышленное оборудование\n"
-            "🏠 Бытовая техника\n"
-            "🔧 Инструменты\n\n"
-            "Бот сканирует 1000+ лотов и фильтрует\n"
-            "по маржинальности. Ежедневная рассылка — в утро.")
+            "/scan — топ-10 лотов по марже\n"
+            "/scan ноутбук — поиск по слову\n"
+            "/scan авто — поиск авто\n\n"
+            "<b>Категории:</b>\n"
+            "🚗 Авто (919 лотов)\n"
+            "🚛 Грузовики/спецтехника (230)\n"
+            "💻 Компьютерная техника (19)\n"
+            "🏭 Производственное оборудование (89)\n"
+            "📡 Сетевое оборудование (88)\n"
+            "🏠 Квартиры (329)\n"
+            "🏢 Нежилые помещения (831)\n"
+            "📦 Металлолом (9)\n\n"
+            "Маржа считается автоматически.")
+
+    elif cmd == "/categories":
+        lines = ["<b>Категории на РАД:</b>\n"]
+        for cid_, (name, margin) in sorted(RAD_CATEGORIES.items()):
+            lines.append(f"  {name} — маржа ~{margin}%")
+        answer(cid, "\n".join(lines))
 
     elif cmd == "/scan":
         keyword = " ".join(args) if args else None
-        send_message(chat_id, "Сканирую торги... 20-40 секунд.")
+        send_message(cid, "Сканирую РАД (lot-online.ru)... 30-60 секунд.")
         try:
-            lots = fetch_torgi_lots()
-
-            # Фильтр по ключевому слову если указано
             if keyword:
-                kw_lower = keyword.lower()
-                if "-" in keyword and all(p.replace(" ","").isdigit() for p in keyword.split("-")):
-                    # Фильтр по цене: 5000-50000
-                    parts = keyword.replace(" ","").split("-")
-                    lo, hi = float(parts[0]), float(parts[1])
-                    lots = [l for l in lots if lo <= l["price"] <= hi]
-                else:
-                    lots = [l for l in lots
-                            if kw_lower in (l.get("title","") + l.get("description","") + l.get("attributes","")).lower()]
-
-            analyzed = analyze_lots(lots)
-            if keyword and "-" not in keyword:
-                msg = f"Результаты поиска «{keyword}»:\n\n"
+                lots = fetch_rad_by_keyword(keyword)
             else:
-                msg = ""
+                lots = fetch_rad_lots()
+            analyzed = analyze(lots, keyword)
+            msg = ""
+            if keyword:
+                msg = f"Результаты: «{keyword}»\n\n"
             msg += fmt_digest(analyzed, 10)
-            send_message(chat_id, msg)
-            log.info(f"Scan done: {len(analyzed)} analyzed from {len(lots)} total (keyword={keyword})")
+            send_message(cid, msg)
+            log.info(f"Scan: {len(analyzed)} from {len(lots)} total (kw={keyword})")
         except Exception as e:
             log.error(f"Scan error: {e}", exc_info=True)
-            answer(chat_id, "Ошибка сканирования. Попробуйте позже.")
+            answer(cid, "Ошибка сканирования.")
 
     else:
-        answer(chat_id, "Неизвестная команда. /help")
+        answer(cid, "Неизвестная команда. /help")
 
-# === ЕЖЕДНЕВНАЯ РАССЫЛКА ===
+# ─── Daily ─────────────────────────────────────────────
 
-def do_daily_digest():
+def do_daily():
     log.info("Daily digest started")
     for cid in load_chat_ids():
         try:
-            lots = fetch_torgi_lots()
-            analyzed = analyze_lots(lots)
+            lots = fetch_rad_lots()
+            analyzed = analyze(lots)
             if analyzed:
                 send_message(cid, "Утренний дайджест торгов:")
                 send_message(cid, fmt_digest(analyzed, 10))
             else:
                 answer(cid, "Сегодня подходящих лотов нет.")
         except Exception as e:
-            log.error(f"Daily digest error: {e}", exc_info=True)
+            log.error(f"Daily error: {e}", exc_info=True)
 
-def daily_scheduler():
+def scheduler():
     tz = ZoneInfo(TIMEZONE)
     last = None
     while True:
@@ -416,21 +390,21 @@ def daily_scheduler():
             now = datetime.now(tz)
             key = now.strftime("%Y-%m-%d")
             if now.hour == DAILY_HOUR and now.minute == DAILY_MINUTE and last != key:
-                do_daily_digest()
+                do_daily()
                 last = key
         except Exception as e:
-            log.error(f"Scheduler error: {e}")
+            log.error(f"Scheduler: {e}")
         time.sleep(30)
 
-# === FLASK ===
+# ─── Flask ─────────────────────────────────────────────
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def index():
     return "Bankrot bot is running!", 200
 
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
     return "OK", 200
 
@@ -439,43 +413,39 @@ def webhook():
     try:
         data = flask_request.get_json()
         if not data: return "OK", 200
-        message = data.get("message")
-        if not message: return "OK", 200
-        chat_id = message["chat"]["id"]
-        text = message.get("text", "")
-        user = message.get("from", {})
-        save_chat_id(chat_id)
+        msg = data.get("message")
+        if not msg: return "OK", 200
+        save_chat_id(msg["chat"]["id"])
+        text = msg.get("text", "")
         if text.startswith("/"):
-            threading.Thread(target=handle_command, args=(chat_id, text, user), daemon=True).start()
+            threading.Thread(target=handle_command,
+                           args=(msg["chat"]["id"], text, msg.get("from", {})),
+                           daemon=True).start()
     except Exception as e:
-        log.error(f"Webhook error: {e}", exc_info=True)
+        log.error(f"Webhook: {e}", exc_info=True)
     return "OK", 200
 
-# === MAIN ===
+# ─── Main ──────────────────────────────────────────────
 
 def main():
-    log.info("Starting bankrot bot...")
+    log.info("Starting bankrot bot (lot-online.ru / RAD)...")
     if not BOT_TOKEN:
-        log.error("BOT_TOKEN not set!")
-        return
+        log.error("BOT_TOKEN not set!"); return
 
     if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        result = api_call("setWebhook", url=webhook_url)
-        if result.get("ok"):
-            log.info(f"Webhook set: {webhook_url}")
-        else:
-            log.error(f"Webhook failed: {result}")
+        r = api_call("setWebhook", url=f"{RENDER_EXTERNAL_URL}/webhook")
+        log.info(f"Webhook: {r}")
 
     api_call("setMyCommands", commands=[
         {"command": "scan", "description": "Поиск лотов на торгах"},
+        {"command": "categories", "description": "Список категорий"},
         {"command": "help", "description": "Справка"},
     ])
 
-    threading.Thread(target=daily_scheduler, daemon=True).start()
-    log.info(f"Daily digest at {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} ({TIMEZONE})")
+    threading.Thread(target=scheduler, daemon=True).start()
+    log.info(f"Daily at {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} ({TIMEZONE})")
 
-    log.info(f"Server on port {PORT}...")
+    log.info(f"Server on {PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False)
 
 if __name__ == "__main__":
