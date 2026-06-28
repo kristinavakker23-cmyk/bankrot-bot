@@ -13,12 +13,12 @@ log = logging.getLogger("llm")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Бесплатные модели (приоритет: скорость + надёжность)
+# Бесплатные модели (приоритет: качество + скорость + русский язык)
 MODELS = [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-chat",
+    "deepseek/deepseek-v3.2",
     "nvidia/nemotron-3-nano-30b-a3b:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-4-31b-it:free",
 ]
 
 SYSTEM_PROMPT = """Ты — аналитик банкротских торгов в России. Отвечай ТОЛЬКО на русском.
