@@ -1,5 +1,6 @@
 """
 Bankrot Bot — ищет лоты на банкротских торгах (lot-online.ru / РАД).
+Сравнивает с рыночными ценами (drom.ru, Bing).
 Версия для Render.com (webhook mode).
 """
 import os, re, sys, time, json, logging, requests, threading
@@ -7,6 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, request as flask_request
 from bs4 import BeautifulSoup
+from market_price import search_market_prices, calculate_margin
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
@@ -248,14 +250,89 @@ def fmt_lot(lot, i):
 
     msg = (
         f"<b>{i}. {title}</b>\n"
-        f"Цена: <b>{p:,.0f} руб.</b>\n"
-        f"Маржа: <b>{m}%</b>\n"
-        f"Продать за: ~<b>{sell:,.0f} руб.</b>\n"
-        f"Прибыль: ~<b>{profit:,.0f} руб.</b>\n"
+        f"Цена на торгах: <b>{p:,.0f} руб.</b>\n"
     )
+
+    # Если есть анализ рынка — показываем
+    ma = lot.get("market_analysis")
+    if ma and ma.get("status") != "no_data":
+        msg += (
+            f"Рыночная цена: <b>{ma['avg_market']:,} руб.</b>\n"
+            f"{ma['emoji']} Маржа: <b>{ma['margin_pct']}%</b>\n"
+            f"Рекомендация: {ma['recommendation']}\n"
+            f"Продать за: <b>{ma['optimal_sell']:,} руб.</b>\n"
+            f"Прибыль: ~<b>{ma['profit_optimal']:,} руб.</b>\n"
+            f"Срок продажи: {ma['time_estimate']}\n"
+        )
+        if ma.get("sources"):
+            srcs = ", ".join(ma["sources"].keys())
+            msg += f"Источники цен: {srcs}\n"
+        msg += f"Найдено цен на рынке: {ma['total_prices']}\n"
+    else:
+        msg += (
+            f"Ожидаемая маржа: <b>{m}%</b>\n"
+            f"Продать за: ~<b>{sell:,.0f} руб.</b>\n"
+            f"Прибыль: ~<b>{profit:,.0f} руб.</b>\n"
+        )
+
     if cat: msg += f"Категория: {cat}\n"
     if end: msg += f"Окончание: {end}\n"
     msg += "Источник: lot-online.ru (РАД)\n"
+    if url: msg += f'<a href="{url}">Перейти к лоту</a>\n'
+    return msg
+
+
+def fmt_lot_full(lot, i):
+    """Полный отчёт по лоту с анализом рынка."""
+    p = lot.get("price", 0)
+    title = lot.get("title", "?")
+    url = lot.get("url", "")
+    cat = lot.get("cat_name", "")
+    end = lot.get("date_end", "")
+
+    msg = f"<b>📊 АНАЛИЗ ЛОТА #{i}</b>\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"<b>{title}</b>\n\n"
+
+    msg += f"<b>🏦 Цена на торгах:</b> {p:,.0f} руб.\n"
+
+    ma = lot.get("market_analysis")
+    if ma and ma.get("status") != "no_data":
+        msg += f"<b>🏪 Рыночная цена:</b> {ma['avg_market']:,} руб.\n"
+        msg += f"  Минимум: {ma['min_market']:,} руб.\n"
+        msg += f"  Максимум: {ma['max_market']:,} руб.\n" if ma.get('max_market') else ""
+        msg += f"\n{ma['emoji']} <b>МАРЖА: {ma['margin_pct']}%</b>\n"
+        msg += f"{ma['recommendation']}\n\n"
+
+        msg += f"<b>💰 РЕКОМЕНДАЦИЯ ПО ПРОДАЖЕ:</b>\n"
+        msg += f"  Быстрая продажа: {ma['quick_sell']:,} руб. (прибыль {ma['profit_quick']:,})\n"
+        msg += f"  Оптимальная цена: {ma['optimal_sell']:,} руб. (прибыль {ma['profit_optimal']:,})\n"
+        msg += f"  Максимальная цена: {ma['max_sell']:,} руб.\n\n"
+
+        msg += f"  ⏱ Срок продажи: {ma['time_estimate']}\n"
+        msg += f"  💸 Налог 13%: ~{ma.get('tax', 0):,} руб.\n"
+        msg += f"  📈 Чистая прибыль: ~{ma.get('profit_net', 0):,} руб.\n"
+
+        if ma.get("sources"):
+            msg += f"\n<b>📍 Источники цен:</b>\n"
+            for src, info in ma["sources"].items():
+                note = info.get("note", "")
+                msg += f"  • {src}: {info['count']} цен, средняя {info['avg']:,} руб."
+                if note:
+                    msg += f" ({note})"
+                msg += "\n"
+    else:
+        msg += f"⚠️ Нет данных о рыночных ценах\n"
+        m = lot.get("margin", 0)
+        sell = int(p * (1 + m / 100))
+        profit = sell - p
+        msg += f"Ожидаемая маржа: {m}%\n"
+        msg += f"Продать за: ~{sell:,} руб.\n"
+        msg += f"Прибыль: ~{profit:,} руб.\n"
+
+    if cat: msg += f"\nКатегория: {cat}"
+    if end: msg += f"\nОкончание: {end}"
+    msg += f"\nИсточник: lot-online.ru (РАД)\n"
     if url: msg += f'<a href="{url}">Перейти к лоту</a>\n'
     return msg
 
@@ -269,8 +346,15 @@ def fmt_digest(lots, n=10):
         lines.append("───────────────────")
     avg = sum(l.get("margin", 0) for l in lots) / len(lots)
     best = max(lots, key=lambda x: x.get("margin", 0))
+
+    # Считаем статистику по рыночным ценам
+    analyzed_count = sum(1 for l in lots if l.get("market_analysis", {}).get("status") not in (None, "no_data"))
+    profitable = sum(1 for l in lots if l.get("market_analysis", {}).get("margin_pct", 0) > 15)
+
     lines.append(f"\nВсего: {len(lots)} лотов | Средняя маржа: {avg:.0f}%")
+    lines.append(f"Проанализировано: {analyzed_count}/{len(lots)} | Выгодных (>15%): {profitable}")
     lines.append(f"Лучший: {best['title'][:40]}... | Маржа: {best['margin']}%")
+    lines.append(f"\n💡 /analyze [номер] — подробный анализ лота")
     return "\n".join(lines)
 
 # ─── Chat IDs ──────────────────────────────────────────
@@ -303,10 +387,12 @@ def handle_command(cid, text, user):
         answer(cid,
             "<b>Бот банкротских торгов (РАД)</b>\n\n"
             "Сканирую catalog.lot-online.ru — ЭТП РАД.\n"
-            "Нахожу лоты с высокой маржинальностью.\n\n"
+            "Нахожу лоты с высокой маржинальностью.\n"
+            "Сравниваю с рыночными ценами (drom.ru, Bing).\n\n"
             "<b>Команды:</b>\n"
-            "/scan — поиск лотов прямо сейчас\n"
+            "/scan — поиск лотов с анализом цен\n"
             "/scan авто — поиск по ключевому слову\n"
+            "/analyze 3 — подробный анализ лота #3\n"
             "/categories — список категорий\n"
             "/help — справка\n\n"
             f"Рассылка: {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} МСК")
@@ -314,9 +400,15 @@ def handle_command(cid, text, user):
     elif cmd == "/help":
         answer(cid,
             "<b>Как пользоваться:</b>\n\n"
-            "/scan — топ-10 лотов по марже\n"
+            "/scan — топ-10 лотов с анализом рынка\n"
             "/scan ноутбук — поиск по слову\n"
-            "/scan авто — поиск авто\n\n"
+            "/scan авто — поиск авто\n"
+            "/analyze 3 — подробный анализ лота #3\n\n"
+            "<b>Анализ включает:</b>\n"
+            "• Рыночные цены (drom.ru для авто, Bing)\n"
+            "• Расчёт маржи и прибыли\n"
+            "• Рекомендацию по цене продажи\n"
+            "• Оценку срока продажи\n\n"
             "<b>Категории:</b>\n"
             "🚗 Авто (919 лотов)\n"
             "🚛 Грузовики/спецтехника (230)\n"
@@ -324,9 +416,8 @@ def handle_command(cid, text, user):
             "🏭 Производственное оборудование (89)\n"
             "📡 Сетевое оборудование (88)\n"
             "🏠 Квартиры (329)\n"
-            "🏢 Нежилые помещения (831)\n"
-            "📦 Металлолом (9)\n\n"
-            "Маржа считается автоматически.")
+            "🏢 Нежилые помещения (831)\n\n"
+            "Маржа считается автоматически по рыночным ценам.")
 
     elif cmd == "/categories":
         lines = ["<b>Категории на РАД:</b>\n"]
@@ -336,22 +427,78 @@ def handle_command(cid, text, user):
 
     elif cmd == "/scan":
         keyword = " ".join(args) if args else None
-        send_message(cid, "Сканирую РАД (lot-online.ru)... 30-60 секунд.")
+        send_message(cid, "Сканирую РАД (lot-online.ru) + анализ рыночных цен... 1-2 минуты.")
         try:
             if keyword:
                 lots = fetch_rad_by_keyword(keyword)
             else:
                 lots = fetch_rad_lots()
             analyzed = analyze(lots, keyword)
+
+            # Анализируем рыночные цены для топ-5 лотов
+            total_lots = len(analyzed)
+            for i, lot in enumerate(analyzed[:5], 1):
+                send_message(cid, f"🔍 Анализ ({i}/5): {lot['title'][:50]}...")
+                try:
+                    market = search_market_prices(lot["title"])
+                    if market:
+                        margin = calculate_margin(lot["price"], market)
+                        lot["market_analysis"] = margin
+                        log.info(f"Market: {lot['title'][:40]} -> {margin['margin_pct']}%")
+                except Exception as e:
+                    log.error(f"Market analysis error: {e}")
+
             msg = ""
             if keyword:
                 msg = f"Результаты: «{keyword}»\n\n"
             msg += fmt_digest(analyzed, 10)
             send_message(cid, msg)
-            log.info(f"Scan: {len(analyzed)} from {len(lots)} total (kw={keyword})")
+            # Сохраняем для /analyze
+            handle_command._last_lots = analyzed
+            log.info(f"Scan: {total_lots} lots, analyzed top 5")
         except Exception as e:
             log.error(f"Scan error: {e}", exc_info=True)
             answer(cid, "Ошибка сканирования.")
+
+    elif cmd == "/analyze":
+        if not args:
+            answer(cid, "Использование: /analyze 3 (номер лота из последнего /scan)")
+            return
+        try:
+            lot_num = int(args[0])
+        except ValueError:
+            answer(cid, "Номер лота должен быть числом.")
+            return
+
+        # Сохраняем лоты для команды analyze
+        if not hasattr(handle_command, '_last_lots'):
+            answer(cid, "Сначала выполните /scan для поиска лотов.")
+            return
+
+        lots = handle_command._last_lots
+        if lot_num < 1 or lot_num > len(lots):
+            answer(cid, f"Лот #{lot_num} не найден. Доступно: 1-{len(lots)}")
+            return
+
+        lot = lots[lot_num - 1]
+        send_message(cid, f"🔍 Анализирую лот #{lot_num}: {lot['title'][:50]}...")
+
+        try:
+            market = search_market_prices(lot["title"])
+            if market:
+                margin = calculate_margin(lot["price"], market)
+                lot["market_analysis"] = margin
+            else:
+                lot["market_analysis"] = {"status": "no_data", "emoji": "❓",
+                                          "recommendation": "Нет данных"}
+        except Exception as e:
+            log.error(f"Market analysis error: {e}")
+            lot["market_analysis"] = {"status": "error", "emoji": "❌",
+                                      "recommendation": f"Ошибка: {e}"}
+
+        msg = fmt_lot_full(lot, lot_num)
+        send_message(cid, msg)
+        log.info(f"Analyze lot #{lot_num}: {lot['title'][:40]}")
 
     else:
         answer(cid, "Неизвестная команда. /help")
