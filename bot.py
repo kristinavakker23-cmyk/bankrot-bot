@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, request as flask_request
 from bs4 import BeautifulSoup
 from market_price import search_market_prices, calculate_margin
+from llm_analyzer import llm_analyze_lot, llm_compare_lots, is_available as llm_available
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
@@ -388,27 +389,31 @@ def handle_command(cid, text, user):
             "<b>Бот банкротских торгов (РАД)</b>\n\n"
             "Сканирую catalog.lot-online.ru — ЭТП РАД.\n"
             "Нахожу лоты с высокой маржинальностью.\n"
-            "Сравниваю с рыночными ценами (drom.ru, Bing).\n\n"
+            "Сравниваю с рыночными ценами (drom.ru, Bing).\n"
+            "🤖 AI-анализ через Gemma (OpenRouter).\n\n"
             "<b>Команды:</b>\n"
             "/scan — поиск лотов с анализом цен\n"
             "/scan авто — поиск по ключевому слову\n"
-            "/analyze 3 — подробный анализ лота #3\n"
+            "/analyze 3 — подробный анализ лота #3 + AI\n"
             "/categories — список категорий\n"
             "/help — справка\n\n"
             f"Рассылка: {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} МСК")
 
     elif cmd == "/help":
+        llm_status = "✅ Включён" if llm_available() else "❌ Не настроен"
         answer(cid,
             "<b>Как пользоваться:</b>\n\n"
             "/scan — топ-10 лотов с анализом рынка\n"
             "/scan ноутбук — поиск по слову\n"
             "/scan авто — поиск авто\n"
-            "/analyze 3 — подробный анализ лота #3\n\n"
+            "/analyze 3 — подробный анализ лота #3 + AI\n\n"
             "<b>Анализ включает:</b>\n"
             "• Рыночные цены (drom.ru для авто, Bing)\n"
             "• Расчёт маржи и прибыли\n"
             "• Рекомендацию по цене продажи\n"
-            "• Оценку срока продажи\n\n"
+            "• Оценку срока продажи\n"
+            "• <b>AI-анализ лотов (Gemma via OpenRouter)</b>\n\n"
+            f"<b>AI-анализатор:</b> {llm_status}\n\n"
             "<b>Категории:</b>\n"
             "🚗 Авто (919 лотов)\n"
             "🚛 Грузовики/спецтехника (230)\n"
@@ -455,6 +460,24 @@ def handle_command(cid, text, user):
             send_message(cid, msg)
             # Сохраняем для /analyze
             handle_command._last_lots = analyzed
+
+            # AI-сравнение топ-3 лотов
+            if llm_available() and len(analyzed) >= 2:
+                send_message(cid, "🤖 AI-сравнение топ-3 лотов...")
+                lots_for_compare = ""
+                for i, lot in enumerate(analyzed[:3], 1):
+                    lots_for_compare += (
+                        f"{i}. {lot['title']} | Цена: {lot['price']:,.0f} руб. | "
+                        f"Категория: {lot.get('cat_name', '?')}\n"
+                    )
+                    ma = lot.get("market_analysis")
+                    if ma and ma.get("status") != "no_data":
+                        lots_for_compare += f"   Рыночная: {ma.get('avg_market', '?')} руб. | Маржа: {ma.get('margin_pct', '?')}%\n"
+
+                comparison = llm_compare_lots(lots_for_compare)
+                if comparison:
+                    send_message(cid, f"<b>🤖 AI-СРАВНЕНИЕ:</b>\n\n{comparison}")
+
             log.info(f"Scan: {total_lots} lots, analyzed top 5")
         except Exception as e:
             log.error(f"Scan error: {e}", exc_info=True)
@@ -496,8 +519,36 @@ def handle_command(cid, text, user):
             lot["market_analysis"] = {"status": "error", "emoji": "❌",
                                       "recommendation": f"Ошибка: {e}"}
 
+        # Формируем рыночные данные для LLM
+        market_data = ""
+        ma = lot.get("market_analysis")
+        if ma and ma.get("status") != "no_data":
+            market_data = (
+                f"Рыночная цена: {ma.get('avg_market', 'нет данных')} руб.\n"
+                f"Мин: {ma.get('min_market', '?')} руб., Макс: {ma.get('max_market', '?')} руб.\n"
+                f"Маржа по рынку: {ma.get('margin_pct', '?')}%\n"
+                f"Источники: {', '.join(ma.get('sources', {}).keys()) if ma.get('sources') else 'Bing/Drom'}"
+            )
+
         msg = fmt_lot_full(lot, lot_num)
         send_message(cid, msg)
+
+        # LLM-анализ
+        if llm_available():
+            send_message(cid, "🤖 Запрашиваю AI-анализ у LLM...")
+            llm_result = llm_analyze_lot(
+                title=lot["title"],
+                price=lot["price"],
+                market_data=market_data,
+                category=lot.get("cat_name", ""),
+            )
+            if llm_result:
+                send_message(cid, f"<b>🤖 AI-АНАЛИЗ (Gemma):</b>\n\n{llm_result}")
+            else:
+                send_message(cid, "⚠️ LLM временно недоступен. Попробуйте позже.")
+        else:
+            send_message(cid, "ℹ️ LLM не настроен. Добавь OPENROUTER_API_KEY в .env")
+
         log.info(f"Analyze lot #{lot_num}: {lot['title'][:40]}")
 
     else:
@@ -575,6 +626,7 @@ def main():
 
     api_call("setMyCommands", commands=[
         {"command": "scan", "description": "Поиск лотов на торгах"},
+        {"command": "analyze", "description": "Подробный AI-анализ лота"},
         {"command": "categories", "description": "Список категорий"},
         {"command": "help", "description": "Справка"},
     ])
